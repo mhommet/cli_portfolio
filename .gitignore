@@ -1,3 +1,4 @@
 .idea/
 .vscode/
-vendor/
+backend/vendor/
+frontend/node_modules/
