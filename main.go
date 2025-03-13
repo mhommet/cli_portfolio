@@ -8,11 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/stopwatch"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -20,7 +20,7 @@ import (
 
 const (
 	padding  = 2
-	maxWidth = 80
+	maxWidth = 9999
 )
 
 var (
@@ -29,7 +29,7 @@ var (
 	paginationStyle   = list.DefaultStyles().PaginationStyle.PaddingLeft(4)
 	helpStyle         = list.DefaultStyles().HelpStyle.PaddingLeft(4).PaddingBottom(1)
 	quitTextStyle     = lipgloss.NewStyle().Margin(1, 0, 2, 4)
-	appStyle          = lipgloss.NewStyle().Padding(1, 2)
+	appStyle          = lipgloss.NewStyle().Padding(1, 2).Align(lipgloss.Center)
 	titleStyle        = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#FFFDF5")).
 				Background(lipgloss.Color("#25A065")).
@@ -106,6 +106,11 @@ type model struct {
 	reposList   list.Model
 	skillsTable table.Model
 	errorMsg    string
+	width       int
+	height      int
+	showSplash  bool
+	splashTimer int
+	stopwatch   stopwatch.Model
 }
 
 func initialModel() model {
@@ -129,6 +134,11 @@ func initialModel() model {
 		loaded:      false,
 		reposList:   projectList,
 		skillsTable: skillsTable,
+		width:       maxWidth,
+		height:      24,
+		showSplash:  true,
+		splashTimer: 20,
+		stopwatch:   stopwatch.NewWithInterval(time.Second),
 	}
 }
 
@@ -176,7 +186,10 @@ type errMsg struct{ err error }
 type openURLMsg string
 
 func (m model) Init() tea.Cmd {
-	return tickCmd()
+	return tea.Batch(
+		tickCmd(),
+		m.stopwatch.Init(),
+	)
 }
 
 func fetchGitHubRepos() tea.Cmd {
@@ -230,6 +243,35 @@ func openURL(url string) tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Mise à jour du stopwatch
+	var swCmd tea.Cmd
+	m.stopwatch, swCmd = m.stopwatch.Update(msg)
+
+	// Si on est sur l'écran d'intro
+	if m.showSplash {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			// Une touche a été pressée, on passe à l'app
+			m.showSplash = false
+			return m, nil
+
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+			return m, nil
+
+		case tickMsg:
+			// Décrémenter le timer du splash
+			m.splashTimer--
+			if m.splashTimer <= 0 {
+				m.showSplash = false
+				return m, nil
+			}
+			return m, tickCmd()
+		}
+		return m, tea.Batch(swCmd)
+	}
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -287,14 +329,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
 		m.progress.Width = msg.Width - padding*2 - 4
 		if m.progress.Width > maxWidth {
 			m.progress.Width = maxWidth
 		}
-		// Update the list height when window size changes
+
+		// Mettre à jour la hauteur et largeur
 		if m.page == "Projects" {
 			h, v := appStyle.GetFrameSize()
-			m.reposList.SetSize(msg.Width-h, msg.Height-v)
+			m.reposList.SetSize(msg.Width-h, msg.Height-v-10)
+		}
+		if m.page == "Skills" {
+			m.skillsTable.SetWidth(msg.Width - 20)
+			m.skillsTable.SetHeight(msg.Height - 15)
 		}
 		return m, nil
 	case tickMsg:
@@ -339,7 +389,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.page == "Projects" {
 		var cmd tea.Cmd
 		m.reposList, cmd = m.reposList.Update(msg)
-		return m, cmd
+		return m, tea.Batch(cmd, swCmd)
 	}
 
 	// Update table if we're on the Skills page
@@ -349,69 +399,221 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	return m, nil
+	// Utiliser le même type de message (tickMsg) que celui déjà défini
+	clockCmd := tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+
+	// Combiner avec les autres commandes
+	return m, tea.Batch(swCmd, clockCmd)
 }
 
 func (m model) View() string {
-	var s string
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	s += titleStyle.Render("Welcome to my portfolio - Milan Hommet") + "\n\n"
+	// Si on doit afficher l'écran d'intro
+	if m.showSplash {
+		mainStyle := lipgloss.NewStyle().
+			Width(m.width).
+			Height(m.height).
+			Align(lipgloss.Center).
+			AlignVertical(lipgloss.Center)
 
-	if m.errorMsg != "" {
-		s += fmt.Sprintf("Error: %s\n", m.errorMsg)
-	} else if m.page == "menu" {
-		for i, section := range m.sections {
-			if i == m.cursor {
-				s += " > " + section + "\n"
-			} else {
-				s += "   " + section + "\n"
-			}
-		}
-		s += "\nControls: ↑/k up • ↓/j down • b back • q quit • ENTER select\n"
-	} else if m.loading {
-		pad := strings.Repeat(" ", padding)
-		s += "Loading...\n\n"
-		s += pad + m.progress.View() + "\n"
-	} else {
-		s += m.getPageContent()
+		// Création d'un conteneur principal bien centré
+		containerStyle := lipgloss.NewStyle().
+			Width(80). // Largeur fixe plus adaptée à l'art ASCII
+			Align(lipgloss.Center).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("#8A2BE2")).
+			Padding(1, 2) // Padding vertical et horizontal
 
-		// Add control hints at the bottom
-		controlsStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
-		s += "\n\n" + controlsStyle.Render("Controls: ↑/k up • ↓/j down • b back • q quit")
+		// Style pour l'art ASCII avec alignement précis
+		nameStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#4287f5")).
+			Align(lipgloss.Center).
+			Width(76) // Légèrement plus petit que le conteneur
+
+		// Style pour le texte de présentation
+		titleStyle := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#ff66c4")).
+			Align(lipgloss.Center).
+			Width(76). // Même largeur que l'art ASCII
+			MarginTop(1)
+
+		// Appliquer les styles
+		artBox := nameStyle.Render(nameArt)
+		title := titleStyle.Render("Milan Hommet - Fullstack Developer")
+
+		// Combinaison de l'art et du titre dans un conteneur
+		content := artBox + "\n" + title
+		containerContent := containerStyle.Render(content)
+
+		return mainStyle.Render(containerContent)
 	}
 
-	return appStyle.Render(s)
+	// Style pour le contenu principal, mais avec une hauteur réduite pour laisser
+	// de la place pour l'en-tête et le pied de page
+	mainStyle := lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height - 4). // Réduire la hauteur pour laisser de la place
+		Align(lipgloss.Center).
+		AlignVertical(lipgloss.Center)
+
+	innerStyle := lipgloss.NewStyle().
+		Width(m.width - 4).
+		Align(lipgloss.Center)
+
+	// Créer un conteneur avec une bordure visible pour l'en-tête
+	headerContainerStyle := lipgloss.NewStyle().
+		Width(m.width).
+		BorderBottom(true).
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#8A2BE2"))
+
+	// Style pour le nom à gauche
+	nameStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#4287f5")).
+		Bold(true).
+		PaddingLeft(4).
+		Width(30)
+
+	// Style pour le titre à droite
+	jobStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#ff66c4")).
+		Bold(true).
+		PaddingRight(4).
+		Align(lipgloss.Right).
+		Width(30)
+
+	// Structure simplifiée pour l'en-tête
+	leftContent := nameStyle.Render("Milan Hommet")
+	rightContent := jobStyle.Render("Fullstack Developer")
+
+	// Joindre les deux parties avec un espace au milieu
+	header := headerContainerStyle.Render(
+		lipgloss.JoinHorizontal(
+			lipgloss.Center,
+			leftContent,
+			lipgloss.NewStyle().
+				Width(m.width-lipgloss.Width(leftContent)-lipgloss.Width(rightContent)).
+				Render(""),
+			rightContent,
+		),
+	)
+
+	// Style pour le pied de page
+	footerStyle := lipgloss.NewStyle().
+		Width(m.width).
+		BorderTop(true).
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#8A2BE2"))
+
+	// Contenu du pied de page
+	clockText := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#888888")).
+		PaddingLeft(4).
+		Width(20).
+		Render("🕒 " + time.Now().Format("15:04:05"))
+
+	timerText := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#888888")).
+		Align(lipgloss.Right).
+		PaddingRight(4).
+		Width(20).
+		Render("⏱ " + m.stopwatch.View())
+
+	footer := footerStyle.Render(
+		lipgloss.JoinHorizontal(
+			lipgloss.Center,
+			clockText,
+			lipgloss.NewStyle().
+				Width(m.width-lipgloss.Width(clockText)-lipgloss.Width(timerText)).
+				Render(""),
+			timerText,
+		),
+	)
+
+	// Contenu principal (comme avant)
+	var inner string
+
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("205")).
+		Align(lipgloss.Center).
+		Width(m.width - 4)
+
+	inner += titleStyle.Render("Welcome to my portfolio") + "\n\n"
+
+	var content string
+	if m.errorMsg != "" {
+		content = fmt.Sprintf("Error: %s\n", m.errorMsg)
+	} else if m.page == "menu" {
+		menuStyle := lipgloss.NewStyle().Align(lipgloss.Center).Width(m.width - 4)
+		menuContent := ""
+		for i, section := range m.sections {
+			if i == m.cursor {
+				menuContent += " > " + section + "\n"
+			} else {
+				menuContent += "   " + section + "\n"
+			}
+		}
+		content = menuStyle.Render(menuContent)
+
+		// Centrer également les contrôles
+		controlsStyle := lipgloss.NewStyle().Align(lipgloss.Center).Width(m.width - 4)
+		content += "\n" + controlsStyle.Render("Controls: ↑/k up • ↓/j down • b back • q quit • ENTER select")
+	} else if m.loading {
+		loadingStyle := lipgloss.NewStyle().Align(lipgloss.Center).Width(m.width - 4)
+		content = loadingStyle.Render("Loading...") + "\n\n"
+		content += m.progress.View() + "\n"
+	} else {
+		content = m.getPageContent()
+
+		// Centrer les contrôles en bas
+		controlsStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Align(lipgloss.Center).Width(m.width - 4)
+		content += "\n\n" + controlsStyle.Render("Controls: ↑/k up • ↓/j down • b back • q quit")
+	}
+
+	inner += content
+
+	// Assembler toutes les parties
+	return header + "\n" + mainStyle.Render(innerStyle.Render(inner)) + "\n" + footer
 }
 
 func (m model) getPageContent() string {
+	contentStyle := lipgloss.NewStyle().
+		Align(lipgloss.Center).
+		Width(m.width - 10)
+
 	switch m.page {
 	case "About Me":
-		return "\nAbout Me:\n" +
+		return contentStyle.Render("\nAbout Me:\n" +
 			"I'm a software developer based in France, specializing in software and mobile development but I'm also interested in game development.\n" +
 			"I'm currently pursuing an MBA in development and management. I like to learn new languages and frameworks in my free time.\n" +
-			"I have a work-study contract at Téïcée as a backend developer.\n"
+			"I have a work-study contract at Téïcée as a backend developer.\n")
 	case "Education":
-		return "\nEducation:\n" +
+		return contentStyle.Render("\nEducation:\n" +
 			"2023 - 2025 : Master degree - Fullstack developer\n" +
 			"2022 - 2023 : Bachelor degree - Web developer\n" +
-			"2020 - 2022 : BTEC Higher National Diploma - web and software development\n"
+			"2020 - 2022 : BTEC Higher National Diploma - web and software development\n")
 	case "Experience":
-		return "\nExperience:\n" +
-			"2022 - today : Fullstack Developer at Téïcée\n"
+		return contentStyle.Render("\nExperience:\n" +
+			"2022 - today : Fullstack Developer at Téïcée\n")
 	case "Skills":
-		return "\nSkills:\n\n" + baseTableStyle.Render(m.skillsTable.View())
+		// Pour les tables, on doit appliquer un style spécial
+		tableContent := "\nSkills:\n\n" + baseTableStyle.Render(m.skillsTable.View())
+		return contentStyle.Render(tableContent)
 	case "Projects":
 		content := m.reposList.View()
 		if m.loaded {
 			content += "\n\nPress Enter to open the selected project in your browser."
 		}
-		return content
+		return content // La liste gère son propre rendu
 	case "Contact":
-		return "\nContact:\n" +
+		return contentStyle.Render("\nContact:\n" +
 			"Email: milan.hommet@protonmail.com\n" +
-			"LinkedIn: https://www.linkedin.com/in/milan-hommet-840414315/\n"
+			"LinkedIn: https://www.linkedin.com/in/milan-hommet-840414315/\n")
 	}
-	return "\nContent for " + m.page
+	return contentStyle.Render("\nContent for " + m.page)
 }
 
 func tickCmd() tea.Cmd {
@@ -420,8 +622,18 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+func clockTickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
 func main() {
-	p := tea.NewProgram(initialModel())
+	p := tea.NewProgram(
+		initialModel(),
+		tea.WithAltScreen(),       // Utilise l'écran alternatif (plein écran)
+		tea.WithMouseCellMotion(), // Supporte les événements de souris
+	)
 	if err := p.Start(); err != nil {
 		fmt.Println("Oh no!", err)
 		os.Exit(1)
